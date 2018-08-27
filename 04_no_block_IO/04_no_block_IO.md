@@ -516,3 +516,415 @@ server.cpp中,获得监昕描述符后,就开始了一个while循环。在这个
 	close(serverfd);
 
 如此,sever就能同时处理多个client的请求,达到提供处理能力的效果。而client.cpp 中,也是连上 server后开始发数据,但这部分比较简单。
+
+### 2.poll ###
+
+#### (1)poll 函数原型 ####
+
+和select函数一样,poll函数也可以用于执行多路复用IO。poll所需要的头文件和函数原型如下所示:
+
+    #include<poll.h>
+    int poll(struct pollfd * fds,unsigned int timeout);
+
+pollfd结构体定义如下所示:
+
+    struct pollfd {
+        int fd; /*文件描述符*/
+        short events;/*等待的事件*/
+        short events;/*实际发生的事件*/
+    }
+
+每一个pollfd结构体指定了一个被监视的文件描述符,可以传递多个结构体,指示poll()监视多个文件描述符。每个结构体的events域是监视该文件描述符的事件掩码,由用户来设置这个域的属性。revents域是文件描述符的操作结果事件掩码,内核在调用返回时设置这个域;并且events域中请求的任何事件都可能在revents域中返回。具体的事件代码和代表的含义如下图所示:
+
+![](./img/poll_event.png)
+
+实际上这些事件在events域中无意义因为它们总会在合适的时候从revents中返回。
+
+使用poll()和select()不一样,不需要显式地请求异常情况报告。
+
+POLLIN | POLLPRI等价于select()的读事件,POLLOUT | POLLWRBAND等价于select()的写事件;POLLIN等价于POLLRDNORM | POLLRDBAND,而POLLOUT则等价于POLLWRNORM。例如,要同时监视一个文件描述符是否可读或可写,可以设置events为POLLIN | POLLOUT。在poll返回时,只要检查revents中的标志,获得对应于文描述符请求的events结构体。如果POLLIN事件被设置,则文件描述符可以被读取而不阻塞;如果POLLOUT 被设置,则文件描述符可以写入而不导致阻塞。这些标志并不是互斥的:它们可能被同时设置,表示这个文件描述符的读取和写人操作都会正常返回而不阻塞。timeout参数指定等待的毫秒数,无论IO是否准备好,poll都会返回。
+
+nfds大小则决定了fds数组的长度。
+
+timeout指定为负数值时表示无限超时,使poll()一直挂起直到一个指定事件发生; timeout为0指示poll调用立即返回并列出准备好IO的文件描述符,但并不等待其他的事件。这种情况下, poll()的返回值,一旦被选举出来,立即返回。成功时,poll()返回结构体中revents域不为0的文件描述符个数:如果在超时前没有任何事件发生,poll()返回0。失败时,poll()返回-1,并设置errno为下列值之一:
+
+(1) EBADF : 一个或多个结构体中指定 的文件描述符无效。
+
+(2) EFAULTfds :指针指向的地址超出进程的地址空间。
+
+(3) EINTR : 请求的事件之前产生一个信号,调用可以重新发起。
+
+(4) EINVALnfds : 参数超出 PLIMIT_NOFILE值。
+
+(5) ENOMEM :可用内存不足,无法完成请求。
+
+#### (2)使用 poll 函数提高服务器处理能力 ####
+
+client.cpp
+
+```cpp
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <strings.h>
+#include <sys/wait.h>
+#include <string.h>
+#include <errno.h>
+#include <poll.h>
+#define MAXLINE     1024
+#define DEFAULT_PORT   6666
+#define max(a,b) (a > b) ? a : b
+static void handle_connection(int sockfd);
+int main(int argc,char *argv[]){
+	int connfd = 0;
+    int cLen = 0;
+    struct sockaddr_in client;
+    if(argc < 2){
+        printf(" Uasge: clientent [server IP address]\n");
+        return -1;
+    }	
+    client.sin_family = AF_INET;
+    client.sin_port = htons(DEFAULT_PORT);
+    client.sin_addr.s_addr = inet_addr(argv[1]);
+    connfd = socket(AF_INET, SOCK_STREAM, 0);
+    if(connfd < 0){
+		perror("socket" );
+        return -1;
+    }
+    if(connect(connfd, (struct sockaddr*)&client, sizeof(client)) < 0){
+ 		perror("connect" );
+        return -1;
+    }
+    /*处理连接描述符*/
+    handle_connection(connfd);
+    return 0;
+}
+static void handle_connection(int sockfd){
+    char    sendline[MAXLINE],recvline[MAXLINE];
+    int     maxfdp,stdineof;
+    struct pollfd pfds[2];
+    int n;
+    /*添加连接描述符*/
+    pfds[0].fd = sockfd;
+    pfds[0].events = POLLIN;
+    /*添加标准输入描述符*/
+    pfds[1].fd = STDIN_FILENO;
+    pfds[1].events = POLLIN;
+    while(1){
+        poll(pfds,2,-1);
+        if (pfds[0].revents & POLLIN){
+            n = read(sockfd,recvline,MAXLINE);
+            if (n == 0){
+                    fprintf(stderr,"client: server is closed.\n");
+                    close(sockfd);
+            }
+            write(STDOUT_FILENO,recvline,n);
+        }
+        /*测试标准输入是否准备好*/
+        if (pfds[1].revents & POLLIN) {
+            n = read(STDIN_FILENO,sendline,MAXLINE);
+            if (n  == 0) {
+                shutdown(sockfd,SHUT_WR);
+				continue;
+            }
+            write(sockfd,sendline,n);
+        }
+    }
+}
+```
+
+server.cpp
+
+```cpp
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <strings.h>
+#include <sys/wait.h>
+#include <string.h>
+#include <errno.h>
+#include <poll.h>
+#define IPADDRESS   "127.0.0.1"
+#define PORT        6666
+#define MAXLINE     1024
+#define LISTENQ     5
+#define OPEN_MAX    1000
+#define INFTIM      -1
+
+/*创建套接字,进行绑定和监听*/
+int bind_and_listen(){
+	int serverfd; /* 监听socket: serverfd*/
+    struct sockaddr_in my_addr; /* 本机地址信息 */
+    unsigned int sin_size;
+    if ((serverfd = socket(AF_INET , SOCK_STREAM, 0)) == -1) {
+       perror("socket" );
+       return -1;
+    }
+    printf("socket ok \n");	
+    my_addr.sin_family=AF_INET;
+    my_addr.sin_port=htons(PORT);
+    my_addr.sin_addr.s_addr = INADDR_ANY;
+    bzero(&(my_addr.sin_zero), 0);
+    if (bind(serverfd, (struct sockaddr *)&my_addr, sizeof(struct sockaddr )) == -1) {
+        perror("bind" );
+        return -2;
+    }
+    printf("bind ok \n");
+    if (listen(serverfd, LISTENQ) == -1) {
+        perror("listen" );
+        return -3;
+    }
+    printf("listen ok \n");
+	return serverfd;
+}
+
+/*IO多路复用poll*/
+void do_poll(int listenfd){
+    int  connfd,sockfd;
+    struct sockaddr_in cliaddr;
+    socklen_t cliaddrlen;
+    struct pollfd clientfds[OPEN_MAX];
+    int maxi;
+    int i;
+    int nready;
+    /*添加监听描述符*/
+    clientfds[0].fd = listenfd;
+    clientfds[0].events = POLLIN;
+    /*初始化客户连接描述符*/
+    for (i = 1;i < OPEN_MAX;i++)
+        clientfds[i].fd = -1;
+    maxi = 0;
+    /*循环处理*/
+    while(1){
+        /*获取可用描述符的个数*/
+        nready = poll(clientfds,maxi+1,INFTIM);
+        if (nready == -1){
+            perror("poll error:");
+            exit(1);
+        }
+
+        /*测试监听描述符是否准备好*/
+        if (clientfds[0].revents & POLLIN){
+            cliaddrlen = sizeof(cliaddr);
+
+        /*接受新的连接*/
+        if ((connfd = accept(listenfd,(struct sockaddr*)&cliaddr,&cliaddrlen)) == -1){
+            if (errno == EINTR)
+                continue;
+            else{
+                perror("accept error:");
+                exit(1);
+            }
+        }
+
+        fprintf(stdout,"accept a new client: %s:%d\n", inet_ntoa(cliaddr.sin_addr), cliaddr.sin_port );
+
+        /*将新的连接描述符添加到数组中*/
+        for (i = 1;i < OPEN_MAX;i++){
+            if (clientfds[i].fd < 0){
+                clientfds[i].fd = connfd;
+                break;
+            }
+        }
+
+        if (i == OPEN_MAX){
+            fprintf(stderr,"too many clients.\n");
+            exit(1);
+        }
+
+        /*将新的描述符添加到读描述符集合中*/
+        clientfds[i].events = POLLIN;
+        /*记录客户连接套接字的个数*/
+        maxi = (i > maxi ? i : maxi);
+        if (--nready <= 0)
+            continue;
+        }
+
+        /*处理多个连接上客户端发来的包*/
+        char buf[MAXLINE];
+        memset(buf,0,MAXLINE);
+        int readlen=0;
+        for (i = 1;i <= maxi;i++){
+            if (clientfds[i].fd < 0)
+                continue;
+            
+            /*测试客户描述符是否准备好*/
+            if (clientfds[i].revents & POLLIN){
+                /*接收客户端发送的信息*/
+                readlen = read(clientfds[i].fd,buf,MAXLINE);
+                if (readlen == 0){
+                    close(clientfds[i].fd);
+                    clientfds[i].fd = -1;
+                    continue;
+                }
+                /*printf("read msg is: ");*/
+                write(STDOUT_FILENO,buf,readlen);
+                /*向客户端发送buf*/
+                write(clientfds[i].fd,buf,readlen);
+            }
+        }
+    }
+}
+
+int main(int argc,char *argv[]){
+    int  listenfd=bind_and_listen();
+
+	if(listenfd<0){
+	    return 0;
+	}
+
+    do_poll(listenfd);
+    
+    return 0;
+}
+```
+
+makefile
+
+    all:server client
+    server:server.o
+        g++ -g -o server server.o
+    client:client.o
+        g++ -g -o client client.o
+    server.o:server.cpp
+        g++ -g -c server.cpp
+    client.o:client.cpp
+        g++ -g -c client.cpp
+    clean:all
+        rm all
+
+编译运行结果如下:
+
+![](./img/poll.png)
+
+上面例中,编写了一个echo server程序,功能是客户端向服务器发送消息,服务器接收输出并原样返回客户端,客户端接收到消息后输出到终端。
+
+server.cpp中,方便阅读,把套接字的创建、绑定和监昕,都写在了一个函数中:
+
+    /*创建套接字,进行绑定和监听*/
+    int bind_and_listen(){
+        int serverfd; /* 监听socket: serverfd*/
+        struct sockaddr_in my_addr; /* 本机地址信息 */
+        unsigned int sin_size;
+        if ((serverfd = socket(AF_INET , SOCK_STREAM, 0)) == -1) {
+           perror("socket" );
+           return -1;
+        }
+        printf("socket ok \n");	
+        my_addr.sin_family=AF_INET;
+        my_addr.sin_port=htons(PORT);
+        my_addr.sin_addr.s_addr = INADDR_ANY;
+        bzero(&(my_addr.sin_zero), 0);
+        if (bind(serverfd, (struct sockaddr *)&my_addr, sizeof(struct sockaddr )) == -1) {
+            perror("bind" );
+            return -2;
+        }
+        printf("bind ok \n");
+        if (listen(serverfd, LISTENQ) == -1) {
+            perror("listen" );
+            return -3;
+        }
+        printf("listen ok \n");
+        return serverfd;
+    }
+
+先把服务器的描述符加入到描述符集合中,需要注意的是,select所用的描述符集合是一个fd_set的结构体中,而poll的描述符却是在一个以pollfd为元素的数组中,代码如下:
+
+    /*添加监听描述符*/
+    clientfds[0].fd = listenfd;
+    clientfds[0].events = POLLIN;
+
+接下来将数组初始化,注意别把第一个元素给覆盖了,因为第一个已添加了服务器描述符。所以i是从1开始,而不是从0开始,代码如下:
+
+    /*初始化客户连接描述符*/
+    for (i = 1;i < OPEN_MAX;i++)
+        clientfds[i].fd = -1;
+
+接着是一个while循环,查看是否有新客户端连接,或者老客户端是否有数据发送过来。这里的超时时间设为-1,表示无限超时,使poll()一直挂起直到一个指定事件发生。而maxi就是clientfds数组中最大的下标。有新client接人时,判断是否放在了比较大的下标位置,如果是的话要就修改maxi的值,如果放在了已经断掉连接的下标位置,则不用更新,代码如下:
+
+    /*获取可用描述符的个数*/
+    nready = poll(clientfds,maxi+1,INFTIM);
+    if (nready == -1){
+        perror("poll error:");
+        exit(1);
+    }
+
+当有新的客户端连接时,必须接受,获得新的fd,并将新fd放到数组中,代码如下:
+
+    /*测试监听描述符是否准备好*/
+    if (clientfds[0].revents & POLLIN){
+        cliaddrlen = sizeof(cliaddr);
+
+    /*接受新的连接*/
+    if ((connfd = accept(listenfd,(struct sockaddr*)&cliaddr,&cliaddrlen)) == -1){
+        if (errno == EINTR)
+            continue;
+        else{
+            perror("accept error:");
+            exit(1);
+        }
+    }
+
+    fprintf(stdout,"accept a new client: %s:%d\n", inet_ntoa(cliaddr.sin_addr), cliaddr.sin_port );
+
+    /*将新的连接描述符添加到数组中*/
+    for (i = 1;i < OPEN_MAX;i++){
+        if (clientfds[i].fd < 0){
+            clientfds[i].fd = connfd;
+            break;
+        }
+    }
+
+    if (i == OPEN_MAX){
+        fprintf(stderr,"too many clients.\n");
+        exit(1);
+    }
+
+    /*将新的描述符添加到读描述符集合中*/
+    clientfds[i].events = POLLIN;
+    /*记录客户连接套接字的个数*/
+    maxi = (i > maxi ? i : maxi);
+    if (--nready <= 0)
+        continue;
+    }
+
+client.cpp值得仔细看一下,这里也用了poll函数进行读写操作。判断是否有数据可读,需要检查两个来源:1-服务器是否发来了包;2-标准输入中是否有输入。代码如下所示:
+
+    struct pollfd pfds[2];
+    int n;
+    /*添加连接描述符*/
+    pfds[0].fd = sockfd;
+    pfds[0].events = POLLIN;
+    /*添加标准输入描述符*/
+    pfds[1].fd = STDIN_FILENO;
+    pfds[1].events = POLLIN;
+    while(1){
+        poll(pfds,2,-1);
+        if (pfds[0].revents & POLLIN){
+            n = read(sockfd,recvline,MAXLINE);
+            if (n == 0){
+                    fprintf(stderr,"client: server is closed.\n");
+                    close(sockfd);
+            }
+            write(STDOUT_FILENO,recvline,n);
+        }
+        /*测试标准输入是否准备好*/
+        if (pfds[1].revents & POLLIN) {
+            n = read(STDIN_FILENO,sendline,MAXLINE);
+            if (n  == 0) {
+                shutdown(sockfd,SHUT_WR);
+				continue;
+            }
+            write(sockfd,sendline,n);
+        }
+    }
+
+综上所述, poll函数也可让服务器具备同时处理多个客户端请求的能力。
